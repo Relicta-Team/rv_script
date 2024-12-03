@@ -8,7 +8,8 @@ from os.path import dirname as pathDir
 PATTERN_INCLUDE = r'\s*#include\s+[<\"]([^>\"]*)[>\"]'
 PATTERN_DEFINE_VAR = r'\s*#define\s+([A-Za-z0-9_]+)(\s+(.+))?'
 PATTERN_DEFINE_FUNC = r'\s*#define\s+([A-Za-z0-9_]+)\((.+)\)(\s+(.+))?'
-PATTERN_CONDITIONAL = r'\s*#(if|ifdef|else|endif|undef)'
+PATTERN_UNDEF = r'\s*#undef\s+([A-Za-z0-9_]+)'
+PATTERN_CONDITIONAL = r'\s*#(if|ifdef|else|endif)'
 PATTERN_DIRECTIVE = r'\s*#(\w+)'
 
 PATTERN_COMMENT_LINE = r'\s*//.*'
@@ -67,6 +68,8 @@ class FilePreprocessor:
 
 		self.macro_vars:dict[str, MacroVariable] = dict()
 
+		self.parent_vars:dict[str, MacroVariable] = dict()
+
 		self.ppv:PreprocessorValidator = None
 		
 		self.curpos = 0
@@ -109,6 +112,8 @@ class FilePreprocessor:
 				self.handleInclude(line)
 			elif match(PATTERN_DEFINE_VAR,line):
 				self.handleDefineVar(line)
+			elif match(PATTERN_UNDEF,line):
+				self.handleUndef(line)
 			elif match(PATTERN_DEFINE_FUNC,line):
 				self.handleDefineFunc(line)
 			elif match(PATTERN_CONDITIONAL,line):
@@ -121,7 +126,7 @@ class FilePreprocessor:
 	
 	def handleDirective(self, line):
 		dirName = match(PATTERN_DIRECTIVE,line).group(1)
-		self.ppv.exceptions.append(PreprocessorException(f'Directive error: Unknown directive "{dirName}" (included from "{self.filename}" at line {self.curline})',self.filename,self.curline))
+		self.ppv.exceptions.append(PreprocessorException(f'Directive error: Unknown directive "{dirName}"',self.filename,self.curline))
 		pass
 
 	def handleInclude(self, line):
@@ -129,14 +134,15 @@ class FilePreprocessor:
 
 		inclPathAbs = pathAbs( pathJoin(pathDir(self.filename),pathIncl) )
 		if not fileExists(inclPathAbs):
-			self.ppv.exceptions.append(PreprocessorException(f'Include error: File "{inclPathAbs}" not found (included from "{self.filename}" at line {self.curline})',self.filename,self.curline))
+			self.ppv.exceptions.append(PreprocessorException(f'Include error: File "{inclPathAbs}" not found',self.filename,self.curline))
 			return
 		
 		if inclPathAbs in self.parentFiles:
-			self.ppv.warnings.append(PreprocessorWarning(f'Include warning: File "{inclPathAbs}" already included (included from "{self.filename}" at line {self.curline})',self.filename,self.curline))
+			self.ppv.warnings.append(PreprocessorWarning(f'Include warning: File "{inclPathAbs}" already included',self.filename,self.curline))
 			return
 
 		pp = FilePreprocessor(inclPathAbs,self.parentFiles + [self.filename])
+		pp.parent_vars = self.macro_vars
 		vld = pp.validate()
 		
 		#todo optional enable for extended logging
@@ -144,7 +150,7 @@ class FilePreprocessor:
 		self.ppv.warnings.extend(vld.warnings)
 
 		if not vld.isValid():
-			self.ppv.exceptions.append(PreprocessorException(f'Include error: File "{inclPathAbs}" invalid content (included from "{self.filename}" at line {self.curline})',self.filename,self.curline))
+			self.ppv.exceptions.append(PreprocessorException(f'Include error: File "{inclPathAbs}" invalid content',self.filename,self.curline))
 			return
 
 		self.includes.add(inclPathAbs)
@@ -159,13 +165,55 @@ class FilePreprocessor:
 		if mfnc.name in self.macro_vars:
 			redefined = True
 			self.ppv.warnings.append(PreprocessorWarning(
-				f'Define warning: Macro "{mfnc.name}" already defined in "{self.macro_vars[mfnc.name].locationFile}" (included from "{self.filename}" at line {self.curline})'
+				f'Define warning: Macro "{mfnc.name}" already defined in "{self.macro_vars[mfnc.name].locationFile}"'
 				,self.filename,self.curline))
+		if mfnc.name in self.parent_vars:
+			redefined = True
+			self.ppv.warnings.append(PreprocessorWarning(
+				f'Define warning: Macro "{mfnc.name}" already defined in "{self.parent_vars[mfnc.name].locationFile}"'
+				,self.filename,self.curline
+			))
 
 		self.macro_vars[mfnc.name] = mfnc
 		pass
 	def handleDefineVar(self, line):
+		grp = match(PATTERN_DEFINE_VAR,line)
+		mfnc = MacroVariable(grp.group(1),grp.group(2))
+		mfnc.setupLocation(self.filename,self.curline)
+		redefined = False
+		if mfnc.name in self.macro_vars:
+			redefined = True
+			self.ppv.warnings.append(PreprocessorWarning(
+				f'Define warning: Macro "{mfnc.name}" already defined in "{self.macro_vars[mfnc.name].locationFile}"'
+				,self.filename,self.curline
+			))
+		if mfnc.name in self.parent_vars:
+			redefined = True
+			self.ppv.warnings.append(PreprocessorWarning(
+				f'Define warning: Macro "{mfnc.name}" already defined in "{self.parent_vars[mfnc.name].locationFile}"'
+				,self.filename,self.curline
+			))
+
+		self.macro_vars[mfnc.name] = mfnc
 		pass
+
+	def handleUndef(self, line):
+		grp = match(PATTERN_UNDEF,line)
+		macroName = grp.group(1)
+		foundUndef = False
+		if macroName in self.macro_vars or macroName in self.parent_vars:
+			if macroName in self.macro_vars:
+				foundUndef = True
+				self.macro_vars.pop(macroName)
+			if macroName in self.parent_vars:
+				foundUndef = True
+				self.parent_vars.pop(macroName)
+		if not foundUndef:
+			self.ppv.warnings.append(PreprocessorWarning(
+				f'Undef warning: Macro "{macroName}" not defined'
+				,self.filename,self.curline
+			))
+
 
 	def applyPreprocInfoFor(self,caller):
 		caller.macro_vars.update(self.macro_vars)
@@ -177,8 +225,8 @@ if __name__ == '__main__':
 	pv = pp.validate()
 
 	for wrn in pv.warnings:
-		print(wrn.message)
+		print(f"[WARNING]: {wrn.message} (file: {wrn.file} at {wrn.line})")
 
 	for ex in pv.exceptions:
-		print(ex.message)
+		print(f"[ERROR]: {ex.message} (file: {ex.file} at {ex.line})")
 
