@@ -6,15 +6,18 @@ from os.path import relpath as pathRelative
 from os.path import dirname as pathDir
 
 PATTERN_INCLUDE = r'\s*#include\s+[<\"]([^>\"]*)[>\"]'
-PATTERN_DEFINE_VAR = r'\s*#define\s+([A-Za-z0-9_]+)(\s+(.+))?'
+PATTERN_DEFINE_VAR = r'\s*#define\s+([A-Za-z0-9_]+)\s*(.+)?'
 PATTERN_DEFINE_FUNC = r'\s*#define\s+([A-Za-z0-9_]+)\((.+)\)(\s+(.+))?'
 PATTERN_UNDEF = r'\s*#undef\s+([A-Za-z0-9_]+)'
 PATTERN_CONDITIONAL = r'\s*#(if|ifdef|else|endif)'
 PATTERN_DIRECTIVE = r'\s*#(\w+)'
+PATTERN_MACRO_USE = r'([A-Za-z0-9_]+)\s*(\()?'
+
+PATTERN_MACRO_ADDLINE = r'\\\s*$'
 
 PATTERN_COMMENT_LINE = r'\s*//.*'
-PATTERN_COMMENT_BLOCK_START = r'\/*'
-PATTERN_COMMENT_BLOCK_END = r'*/'
+PATTERN_COMMENT_BLOCK_START = r'\/\*'
+PATTERN_COMMENT_BLOCK_END = r'\*\/'
 
 class PreprocessorException(Exception):
 	def __init__(self, message,file,line):
@@ -95,31 +98,33 @@ class FilePreprocessor:
 
 		while self.curpos < len(lines):
 			line = lines[self.curpos]
+			
 
-			# if inBlockComment:
-			# 	if match(PATTERN_COMMENT_BLOCK_END,line):
-			# 		inBlockComment = False
-			# 	else:
-			# 		self.curpos += 1
-			# 		continue
-
-			# if not inBlockComment and match(PATTERN_COMMENT_BLOCK_START,line):
-			# 	inBlockComment = True
+			if not inBlockComment and match(PATTERN_COMMENT_BLOCK_START,line):
+				inBlockComment = True
+			if inBlockComment and match(PATTERN_COMMENT_BLOCK_END,line):
+				inBlockComment = False
+			
+			if inBlockComment:
+				self.curpos += 1
+				continue
 
 			if match(PATTERN_COMMENT_LINE,line):
 				pass
 			elif match(PATTERN_INCLUDE,line):
 				self.handleInclude(line)
+			elif match(PATTERN_DEFINE_FUNC,line):
+				self.handleDefineFunc(line)
 			elif match(PATTERN_DEFINE_VAR,line):
 				self.handleDefineVar(line)
 			elif match(PATTERN_UNDEF,line):
 				self.handleUndef(line)
-			elif match(PATTERN_DEFINE_FUNC,line):
-				self.handleDefineFunc(line)
 			elif match(PATTERN_CONDITIONAL,line):
 				pass # conditional directives no throws errors
 			elif match(PATTERN_DIRECTIVE,line):
 				self.handleDirective(line)
+			elif match(PATTERN_MACRO_USE,line):
+				self.handleMacroUse(line)
 			self.curpos += 1
 
 		self.ppv = None
@@ -178,7 +183,7 @@ class FilePreprocessor:
 		pass
 	def handleDefineVar(self, line):
 		grp = match(PATTERN_DEFINE_VAR,line)
-		mfnc = MacroVariable(grp.group(1),grp.group(2))
+		mfnc = MacroVariable(grp.group(1),grp.group(2) or "")
 		mfnc.setupLocation(self.filename,self.curline)
 		redefined = False
 		if mfnc.name in self.macro_vars:
@@ -214,6 +219,61 @@ class FilePreprocessor:
 				,self.filename,self.curline
 			))
 
+	def handleMacroUse(self, line):
+		grp = match(PATTERN_MACRO_USE,line)
+		macroName = grp.group(1)
+		self._resolveMacro()
+
+	def _resolveMacro(self):
+		
+		curl = self.all_lines[self.curpos]
+		content = curl
+		baseline = self.curpos
+		while match(PATTERN_MACRO_ADDLINE,curl):
+			self.curpos += 1
+			curl = self.all_lines[self.curpos]
+			content += curl
+
+		pat_int_muse = r'([A-Za-z0-9_]+)\(([^\(\)]*)\)'
+
+		#find functions
+		while match(pat_int_muse,content):
+			grp = match(pat_int_muse,content)
+			name=grp.group(1)
+			args=grp.group(2)
+			pmacr = self.getMacro(name)
+			if pmacr is None:
+				self.ppv.exceptions.append(PreprocessorException(f'Macro "{name}" not defined',self.filename,self.curline))
+				return
+			if not pmacr.isFunction():
+				self.ppv.exceptions.append(PreprocessorException(f'Macro "{name}" is not a function',self.filename,self.curline))
+				return
+			argvals = args.split(',')
+			if len(argvals) != len(pmacr.argumentList):
+				self.ppv.exceptions.append(PreprocessorException(f'Wrong number of arguments for macro "{name}" ({len(argvals)} instead of {len(pmacr.argumentList)})',self.filename,self.curline))
+				return
+			content = content.replace(grp.group(0),"$__REPLACED__$")
+		
+		#find vars
+		while match(r'([A-Za-z0-9_]+)(\(?)',content):
+			grp = match(r'([A-Za-z0-9_]+)(\(?)',content)
+			name = grp.group(1)
+			hasOpenBracket = grp.group(2)
+			pmacr = self.getMacro(name)
+			if pmacr:
+				if pmacr.isConstVariable() and hasOpenBracket:
+					self.ppv.exceptions.append(PreprocessorException(f'Macro "{name}" is not a function',self.filename,self.curline))
+					return
+				if pmacr.isFunction() and not hasOpenBracket:
+					self.ppv.exceptions.append(PreprocessorException(f'Macro "{name}" missing brackets',self.filename,self.curline))
+			content = content.replace(grp.group(0),'$__REPLACED__$')
+
+	def getMacro(self,defname):
+		if defname in self.macro_vars:
+			return self.macro_vars[defname]
+		if defname in self.parent_vars:
+			return self.parent_vars[defname]
+		return None
 
 	def applyPreprocInfoFor(self,caller):
 		caller.macro_vars.update(self.macro_vars)
